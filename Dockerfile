@@ -27,14 +27,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsuitesparse-dev \
     libcurl4-openssl-dev \
     libssl-dev \
-    libmkl-full-dev \
+    gfortran \
+    libopenblas-openmp-dev \
+    liblapack-dev \
  && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /usr/include/opencv4
+ && mkdir -p /usr/include/opencv4 \
+ && update-alternatives --set libblas.so.3-x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/openblas-openmp/libblas.so.3 || true \
+ && update-alternatives --set liblapack.so.3-x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/openblas-openmp/liblapack.so.3 || true
 
 # Colmap build
 WORKDIR /tmp
 RUN git clone https://github.com/colmap/colmap.git && \
-    cmake -S colmap -B colmap/build -GNinja -DBLA_VENDOR=Intel10_64lp && \
+    cmake -S colmap -B colmap/build -GNinja -DBLA_VENDOR=OpenBLAS && \
     cmake --build colmap/build && \
     cmake --install colmap/build && \
     rm -rf colmap
