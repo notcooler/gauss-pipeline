@@ -44,4 +44,11 @@ RUN git clone https://github.com/colmap/colmap.git && \
     rm -rf colmap
 
 # nerfstudio
-RUN pip install --no-cache-dir nerfstudio
+# NOTE: base image ships python3-blinker 1.7.0 via apt
+# (/usr/lib/python3/dist-packages, no RECORD) which pip cannot uninstall:
+# "ERROR: Cannot uninstall blinker 1.7.0, RECORD file not found."
+# Purge the apt copy so pip can install a fresh one. (Global --ignore-installed
+# was tried and caused mixed numpy 1.26/2.5 files + broken cv2/torch imports,
+# so use a surgical purge + normal pip install instead.)
+RUN apt-get update && apt-get purge -y python3-blinker && rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir --break-system-packages nerfstudio
