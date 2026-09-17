@@ -1,5 +1,10 @@
 FROM vastai/base-image:cuda-12.8.1-auto
 
+# ffmpeg (preprocess frame extraction) + keep lists tidy
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
 # Colmap Deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -43,7 +48,7 @@ RUN git clone https://github.com/colmap/colmap.git && \
     cmake --install colmap/build && \
     rm -rf colmap
 
-# nerfstudio
+# nerfstudio + preprocess deps (opencv is CPU-only, no CUDA weight)
 # NOTE: base image ships python3-blinker 1.7.0 via apt
 # (/usr/lib/python3/dist-packages, no RECORD) which pip cannot uninstall:
 # "ERROR: Cannot uninstall blinker 1.7.0, RECORD file not found."
@@ -51,4 +56,4 @@ RUN git clone https://github.com/colmap/colmap.git && \
 # was tried and caused mixed numpy 1.26/2.5 files + broken cv2/torch imports,
 # so use a surgical purge + normal pip install instead.)
 RUN apt-get update && apt-get purge -y python3-blinker && rm -rf /var/lib/apt/lists/* && \
-    pip install --no-cache-dir --break-system-packages nerfstudio
+    pip install --no-cache-dir --break-system-packages nerfstudio opencv-python-headless
