@@ -8,6 +8,20 @@ each window keeps its sharpest, well-exposed frames. Windowing guarantees
 temporal coverage (doorway transitions survive) while blur and blown-out
 frames are discarded.
 
+Decode path: ffmpeg -> MJPEG image2pipe -> cv2.imdecode. NOTE: do NOT switch
+this to `-f rawvideo -pix_fmt bgr24` (or rgb24/yuv420p): for some HEVC .mov
+files (observed with Blackmagic 1214x2160 HEVC) the rawvideo pipe yields
+frames corrupted with horizontal striping while the encoded-image path
+decodes the same frames perfectly. The stripes also fool the sharpness
+metric, so the corruption is silent without visual inspection.
+
+Transpose guard: this ffmpeg build's HEVC decoder outputs some files
+transposed (W/H swapped) relative to the container dimensions. The script
+detects this on the first decoded frame (decoded dims exactly swapped vs
+probe, non-square video) and transposes every frame back, logging it loudly.
+Without the guard the old code reshaped transposed rawvideo bytes with the
+probed dims, which produced the same striping symptom as above.
+
 Codecs: H.264 and H.265 are both accepted (anything ffmpeg decodes works;
 anything else prints a warning and is attempted anyway).
 
@@ -57,6 +71,44 @@ def probe(path):
         "duration": duration,
         "total_frames": total,
     }
+
+
+def iter_jpeg_frames(pipe):
+    """Yield raw JPEG byte strings from an ffmpeg image2pipe stdout.
+
+    Splits the byte stream on SOI (FFD8)..EOI (FFD9) markers. Safe because
+    ffmpeg's MJPEG output contains no bare FFD8/FFD9 except the frame
+    delimiters (0xFF bytes inside entropy data are stuffed as FF00).
+    """
+    data = b""
+    while True:
+        chunk = pipe.read(65536)
+        if chunk:
+            data += chunk
+        while True:
+            start = data.find(b"\xff\xd8")
+            if start < 0:
+                data = data[-1:]  # keep possible split-marker prefix
+                break
+            end = data.find(b"\xff\xd9", start + 2)
+            if end < 0:
+                if start > 0:
+                    data = data[start:]
+                break
+            yield data[start:end + 2]
+            data = data[end + 2:]
+        if not chunk:
+            break
+
+
+def decode_frame(jpg_bytes, idx):
+    """Decode one MJPEG frame to BGR, exiting loudly on failure."""
+    arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        sys.exit(f"error: JPEG decode failed for frame {idx} "
+                 f"({len(jpg_bytes)} bytes)")
+    return bgr
 
 
 def score_frame(bgr):
@@ -121,10 +173,11 @@ def main():
     print(f"window: {window_frames} frames, keep {args.keep_per_window}/window",
           file=sys.stderr)
 
-    frame_bytes = info["width"] * info["height"] * 3
+    # Decode via MJPEG image2pipe (NOT rawvideo bgr24 — see module docstring).
+    # -q:v 2 is visually lossless; kept frames are re-encoded at --jpg-quality.
     ffmpeg = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", str(src),
-         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
+         "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "pipe:1"],
         stdout=subprocess.PIPE,
     )
 
@@ -137,6 +190,7 @@ def main():
     kept_count = 0
     flagged_count = 0
     empty_windows = 0
+    transpose = False
     last_kept_gray = None
     window = []  # (index, bgr, sharpness, luma, clipped, gray)
     idx = 0
@@ -192,12 +246,23 @@ def main():
                                  exposure_ok(luma, clipped, args), False,
                                  "not_sharpest_in_window"])
 
-    while True:
-        raw = ffmpeg.stdout.read(frame_bytes)
-        if len(raw) < frame_bytes:
-            break
-        bgr = np.frombuffer(raw, dtype=np.uint8).reshape(
-            info["height"], info["width"], 3)
+    for jpg in iter_jpeg_frames(ffmpeg.stdout):
+        bgr = decode_frame(jpg, idx)
+        if idx == 0:
+            dh, dw = bgr.shape[:2]
+            pw, ph = info["width"], info["height"]
+            if dh == ph and dw == pw:
+                transpose = False
+            elif dh == pw and dw == ph and pw != ph:
+                transpose = True
+                print(f"note: decoder outputs {dw}x{dh} (transposed vs "
+                      f"container {pw}x{ph}); transposing frames back",
+                      file=sys.stderr)
+            else:
+                sys.exit(f"error: decoded frame is {dw}x{dh} but container "
+                         f"is {pw}x{ph}; refusing to guess orientation")
+        if transpose:
+            bgr = cv2.transpose(bgr)
         sharp, luma, clipped, gray = score_frame(bgr)
         window.append((idx, bgr.copy(), sharp, luma, clipped, gray))
         if len(window) >= window_frames:
@@ -207,7 +272,10 @@ def main():
         if idx % PROGRESS_EVERY == 0:
             print(f"  scored {idx}/{info['total_frames']}...", file=sys.stderr)
     flush_window(window)
-    ffmpeg.wait()
+    rc = ffmpeg.wait()
+    if rc != 0:
+        sys.exit(f"error: ffmpeg decode exited with code {rc} "
+                 f"after {idx} frames")
     report.close()
 
     summary = {
@@ -221,6 +289,7 @@ def main():
             "max_luma", "max_clipped_frac", "no_dedup", "dedup_mse",
             "jpg_quality")},
         "window_frames": window_frames,
+        "transposed": transpose,
         "kept_count": kept_count,
         "exposure_flagged": flagged_count,
         "empty_windows": empty_windows,
